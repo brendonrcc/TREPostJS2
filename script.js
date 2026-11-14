@@ -86,6 +86,12 @@ const TRE2_BASE_OR_ROOM_TRAININGS = ['TCG', 'TMO', 'TS'];
 const ACCESS_NOT_FOUND_MESSAGE = 'Usuário não encontrado na lista de acessos dos Treinadores.';
 const ACCESS_CHECK_PENDING_MESSAGE = 'Aguarde a verificação de acesso dos Treinadores antes de postar.';
 const POST_TIMEOUT_MS = 60000;
+// TRE.1: evita aguardar os redirecionamentos lentos do ContentService.
+const TRE1_POST_TIMEOUT_MS = 9000;
+const TRE1_RECEIPT_TIMEOUT_MS = 3500;
+const TRE1_RECEIPT_ATTEMPTS = 2;
+const TRE1_RECEIPT_INTERVAL_MS = 800;
+const TRE1_STATUS_INDICATOR_MS = 2800;
 const DUPLICATE_SUBMISSION_WINDOW_MS = 30 * 60 * 1000;
 const RECENT_SUBMISSIONS_STORAGE_KEY = 'tre_recent_postagens';
 const SHEET_CONFIRMATION_ERROR = 'SHEET_CONFIRMATION_FAILED';
@@ -1079,6 +1085,7 @@ clearTimeout(reportStateResetTimer);
 setSubmitState('loading');
 setPostActionsVisible('');
 setVerificationActionsVisible(false);
+hidePostingStatus();
 
 try {
 const data = collectReportData();
@@ -1145,23 +1152,44 @@ pendingReportForVerification = { data, baselineCount: sheetBaselineCount };
 rememberRecentReportSubmission(data); // antes do envio: a falha de rede não garante que o servidor não recebeu
 
 if (isTre1Report) {
-try {
-await postTre1ToMacro(data);
-await confirmReportInSheet(data, sheetBaselineCount);
-} catch (err) {
-const rejected = err && err.code === 'TRE_BACKEND_REJECTED';
-if (rejected) {
-  forgetRecentReportSubmission(data);
-  pendingReportForVerification = null;
-}
-const feedback = getSheetPostFailureFeedback(err, false);
-setVerificationActionsVisible(!rejected);
-showValidation([feedback.validation]);
-setSubmitState('fail');
-showToast(feedback.toast, 'error');
-scheduleSubmitStateReset(1800);
-return;
-}
+  let deliveredToEndpoint = false;
+  // A tela nunca fica parada indefinidamente no estado "Enviando...".
+  const indicatorTimer = setTimeout(() => {
+    if (!pendingReportForVerification || pendingReportForVerification.data !== data) return;
+    setSubmitState('pending');
+    showPostingStatus('Estamos processando o envio. Não clique em Postar novamente: a gravação pode já ter acontecido.');
+  }, TRE1_STATUS_INDICATOR_MS);
+  try {
+    await postTre1ToMacro(data);
+    deliveredToEndpoint = true; // Resposta opaca: NÃO comprova gravação.
+    setSubmitState('pending');
+    showPostingStatus('Solicitação encaminhada. Conferindo o registro em segundo plano, sem reenviar dados.');
+    await confirmReportInSheet(data, sheetBaselineCount);
+  } catch (err) {
+    const rejected = err && err.code === 'TRE_BACKEND_REJECTED';
+    if (rejected) {
+      forgetRecentReportSubmission(data);
+      pendingReportForVerification = null;
+      hidePostingStatus();
+      setVerificationActionsVisible(false);
+      showValidation(['O servidor recusou a postagem: ' + err.message]);
+      setSubmitState('fail');
+      showToast('Postagem recusada pelo servidor. Corrija os campos.', 'error');
+      scheduleSubmitStateReset(1600);
+      return;
+    }
+    // Falha na CONSULTA não pode ser apresentada como falha na POSTAGEM.
+    setSubmitState('pending');
+    showPostingStatus(deliveredToEndpoint
+      ? 'O envio foi encaminhado, mas a confirmação automática está indisponível. A postagem pode já estar na planilha. Confira o registro abaixo antes de qualquer novo envio.'
+      : 'O navegador não conseguiu concluir a comunicação. A postagem pode ter sido gravada mesmo assim. Confira a planilha antes de tentar novamente.');
+    setVerificationActionsVisible(true);
+    byId('validation-message').classList.remove('show');
+    showToast('Confirmação pendente. Não reenvie antes de conferir.', 'info');
+    return;
+  } finally {
+    clearTimeout(indicatorTimer);
+  }
 }
 
 if (isTre2Report) {
@@ -1238,6 +1266,7 @@ return;
 
 pendingReportForVerification = null;
 setVerificationActionsVisible(false);
+hidePostingStatus();
 byId('validation-message').classList.remove('show');
 clearPostedReportFields(data);
 setSubmitState('done');
@@ -1250,16 +1279,19 @@ reportSubmitInProgress = false;
 }
 }
 
-async function postJsonNoCors(url, payload) {
+async function postJsonNoCors(url, payload, options = {}) {
 if (!url) throw new Error('O endereço do serviço de postagem não foi configurado.');
 
 const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-const timeoutId = controller ? setTimeout(() => controller.abort(), POST_TIMEOUT_MS) : null;
+const timeoutId = controller ? setTimeout(() => controller.abort(), options.timeoutMs || POST_TIMEOUT_MS) : null;
 
 try {
 await fetch(url, {
 method: 'POST',
 mode: 'no-cors',
+// Com o Apps Script, resolve na primeira resposta de redirecionamento,
+// sem ficar aguardando a URL temporária de script.googleusercontent.com.
+redirect: options.manualRedirect ? 'manual' : 'follow',
 headers: {
 'Content-Type': 'text/plain;charset=utf-8'
 },
@@ -1278,48 +1310,48 @@ if (timeoutId) clearTimeout(timeoutId);
 }
 
 // O envio no-cors produz uma resposta opaca. A validação só considera dados legíveis na planilha.
-async function confirmReportInSheet(data, baselineCounts) {
+async function confirmReportInSheet(data, baselineCounts, options = {}) {
+  if (RECEIPT_SUPPORTED[data.cargo]) {
+    const attempts = options.singleAttempt ? 1 : TRE1_RECEIPT_ATTEMPTS;
+    let lastFailure = null;
+    let lastStatus = 'unknown';
+    for (let attempt = 0; attempt < attempts; attempt++) {
+      try {
+        const receipt = await fetchReportReceipt(data);
+        lastStatus = receipt && receipt.status || 'unknown';
+        if (lastStatus === 'saved') return true;
+        if (lastStatus === 'rejected') {
+          const err = new Error(String(receipt.error || 'Dados recusados pelo servidor.').slice(0, 800));
+          err.code = 'TRE_BACKEND_REJECTED';
+          throw err;
+        }
+      } catch (err) {
+        if (err && err.code === 'TRE_BACKEND_REJECTED') throw err;
+        lastFailure = err;
+      }
+      if (attempt + 1 < attempts) await delay(TRE1_RECEIPT_INTERVAL_MS);
+    }
+    const err = new Error(lastStatus === 'pending'
+      ? 'O processamento ainda não terminou.'
+      : 'A consulta automática não conseguiu verificar o registro.');
+    err.code = 'TRE_RECEIPT_UNCONFIRMED';
+    err.cause = lastFailure;
+    throw err;
+  }
+  // Serviços TRE.2, TRE.3, Graduadores e Retificação mantêm a checagem legada.
   await delay(SHEET_VERIFY_INITIAL_DELAY_MS);
   let lastFailure = null;
   let hadReadableQuery = false;
-  let lastReceiptStatus = 'unknown';
   for (let attempt = 0; attempt < SHEET_VERIFY_ATTEMPTS; attempt++) {
-    if (RECEIPT_SUPPORTED[data.cargo]) {
-      // Sem depender do Google Sheets publicar o conteúdo, consulta o servidor.
-      try {
-        const receipt = await fetchReportReceipt(data);
-        lastReceiptStatus = receipt && receipt.status || 'unknown';
-        if (lastReceiptStatus === 'saved') return true;
-        if (lastReceiptStatus === 'rejected') {
-          const error = new Error(String(receipt.error || 'Dados recusados pelo servidor.').slice(0, 800));
-          error.code = 'TRE_BACKEND_REJECTED';
-          throw error;
-        }
-      } catch (err) {
-        if (err.code === 'TRE_BACKEND_REJECTED') throw err;
-        lastFailure = err;
+    try {
+      const now = await getReportSheetMatchCounts(data);
+      for (const [key, count] of Object.entries(now)) {
+        if (!Object.prototype.hasOwnProperty.call(baselineCounts, key)) continue;
+        hadReadableQuery = true;
+        if (count > baselineCounts[key]) return true;
       }
-    } else {
-      try {
-        const now = await getReportSheetMatchCounts(data);
-        for (const [key, count] of Object.entries(now)) {
-          if (!Object.prototype.hasOwnProperty.call(baselineCounts, key)) continue;
-          hadReadableQuery = true;
-          if (count > baselineCounts[key]) return true;
-        }
-      } catch (err) {
-        lastFailure = err;
-      }
-    }
+    } catch (err) { lastFailure = err; }
     if (attempt < SHEET_VERIFY_ATTEMPTS - 1) await delay(SHEET_VERIFY_INTERVAL_MS);
-  }
-  if (RECEIPT_SUPPORTED[data.cargo]) {
-    const error = new Error(lastReceiptStatus === 'pending'
-      ? 'O servidor recebeu a solicitação, mas ainda não confirmou a gravação.'
-      : (lastFailure ? 'Não foi possível consultar o recibo do Apps Script.'
-        : 'O servidor ainda não encontrou o identificador desta solicitação.'));
-    error.code = 'TRE_RECEIPT_UNCONFIRMED';
-    throw error;
   }
   if (!hadReadableQuery && lastFailure) throw lastFailure;
   throw new Error(SHEET_CONFIRMATION_ERROR);
@@ -1360,7 +1392,7 @@ function fetchReportReceipt(data) {
     const callback = `__treReceipt_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const script = document.createElement('script');
     let done = false;
-    const timeoutId = setTimeout(() => finish(new Error('Tempo limite da consulta de recibo.')), 7000);
+    const timeoutId = setTimeout(() => finish(new Error('Tempo limite da consulta de recibo.')), TRE1_RECEIPT_TIMEOUT_MS);
     function finish(err, result) {
       if (done) return;
       done = true;
@@ -1592,17 +1624,20 @@ function pruneRecentReportSubmissions(recent, now) {
 
 function setVerificationActionsVisible(visible) {
   byId('verification-actions')?.classList.toggle('hidden', !visible);
+  byId('tre1-verification-sheet-link')?.classList.toggle('hidden', !visible || !pendingReportForVerification || pendingReportForVerification.data.cargo !== 'TRE.1');
 }
 
 async function recheckPendingReport() {
   if (reportSubmitInProgress || !pendingReportForVerification) return;
   reportSubmitInProgress = true;
   setSubmitState('loading');
+  if (pendingReportForVerification.data.cargo === 'TRE.1') showPostingStatus('Conferindo o recibo sem reenviar a postagem...');
   const { data, baselineCount } = pendingReportForVerification;
   try {
-    await confirmReportInSheet(data, baselineCount);
+    await confirmReportInSheet(data, baselineCount, { singleAttempt: data.cargo === 'TRE.1' });
     pendingReportForVerification = null;
     setVerificationActionsVisible(false);
+    hidePostingStatus();
     byId('validation-message').classList.remove('show');
     clearPostedReportFields(data);
     setSubmitState('done');
@@ -1621,6 +1656,14 @@ async function recheckPendingReport() {
       forgetRecentReportSubmission(data);
       pendingReportForVerification = null;
       setVerificationActionsVisible(false);
+      hidePostingStatus();
+    }
+    if (data.cargo === 'TRE.1' && (!err || err.code !== 'TRE_BACKEND_REJECTED')) {
+      setSubmitState('pending');
+      showPostingStatus('Ainda não foi possível obter confirmação automática. A postagem pode já estar registrada. Confira a planilha; não reenvie sem verificar.');
+      setVerificationActionsVisible(true);
+      showToast('Confira o registro na planilha.', 'info');
+      return;
     }
     const feedback = getSheetPostFailureFeedback(err, data.cargo === 'Retificação');
     showValidation([feedback.validation]);
@@ -1633,7 +1676,7 @@ async function recheckPendingReport() {
 
 function allowManualResubmission() {
   if (reportSubmitInProgress || !pendingReportForVerification) return;
-  const confirmed = window.confirm('Verifique a planilha antes de continuar. Se a primeira postagem já estiver registrada, um novo envio pode gerar DUPLICIDADE. Tem certeza de que conferiu e deseja permitir nova tentativa?');
+  const confirmed = window.confirm('Você conferiu a planilha e TEM CERTEZA de que o registro não existe? Não prossiga se já constar, pois uma nova postagem pode duplicar dados. Deseja liberar uma nova tentativa?');
   if (!confirmed) return;
   // Reutilize o MESMO requestId: com protocolo de recibos, o servidor não grava duas vezes.
   const data = pendingReportForVerification.data;
@@ -1648,6 +1691,7 @@ function allowManualResubmission() {
   }
   pendingReportForVerification = null;
   setVerificationActionsVisible(false);
+  hidePostingStatus();
   showValidation(['Nova tentativa liberada. O TRE.1 reutiliza o identificador para impedir duplicações no servidor; nos demais cargos, um novo envio ainda pode duplicar registros.']);
   setSubmitState('idle');
 }
@@ -1674,7 +1718,10 @@ return (hash >>> 0).toString(36);
 }
 
 async function postTre1ToMacro(data) {
-await postJsonNoCors(TRE1_MACRO_URL, createTre1MacroPayload(data));
+  await postJsonNoCors(TRE1_MACRO_URL, createTre1MacroPayload(data), {
+    timeoutMs: TRE1_POST_TIMEOUT_MS,
+    manualRedirect: true
+  });
 }
 
 function createTre1MacroPayload(data) {
@@ -2339,12 +2386,25 @@ box.innerHTML = errors.map(error => `<div>${escapeHtml(error)}</div>`).join('');
 box.classList.add('show');
 }
 
+function showPostingStatus(message) {
+  const el = byId('posting-status');
+  if (!el) return;
+  el.textContent = message;
+  el.classList.remove('hidden');
+}
+function hidePostingStatus() {
+  const el = byId('posting-status');
+  if (!el) return;
+  el.textContent = '';
+  el.classList.add('hidden');
+}
+
 function setSubmitState(state) {
-const shouldLock = state === 'loading' || state === 'done';
+const shouldLock = state === 'loading' || state === 'done' || state === 'pending';
 [byId('btn_submit'), byId('btn_submit_tre2'), byId('btn_submit_tre3'), byId('btn_submit_grad'), byId('btn_submit_rectification')].filter(Boolean).forEach(btn => {
-btn.classList.remove('loading', 'done', 'fail');
+btn.classList.remove('loading', 'done', 'fail', 'pending');
 btn.disabled = shouldLock;
-if (state !== 'idle') btn.classList.add(state);
+if (state !== 'idle' && (state !== 'pending' || btn.id === 'btn_submit')) btn.classList.add(state);
 });
 setReportFieldsDisabled(shouldLock);
 }
@@ -2511,9 +2571,9 @@ function showToast(message, type) {
 const toast = byId('toast');
 const icon = toast.querySelector('i');
 byId('toast-text').textContent = message;
-toast.classList.remove('toast-error', 'toast-success', 'show');
-toast.classList.add(type === 'success' ? 'toast-success' : 'toast-error');
-icon.className = type === 'success' ? 'fa-solid fa-circle-check' : 'fa-solid fa-circle-xmark';
+toast.classList.remove('toast-error', 'toast-success', 'toast-info', 'show');
+toast.classList.add(type === 'success' ? 'toast-success' : type === 'info' ? 'toast-info' : 'toast-error');
+icon.className = type === 'success' ? 'fa-solid fa-circle-check' : type === 'info' ? 'fa-solid fa-circle-info' : 'fa-solid fa-circle-xmark';
 requestAnimationFrame(() => toast.classList.add('show'));
 setTimeout(() => toast.classList.remove('show'), 3600);
 }
